@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# bhushan - a simple Python environment manager (like conda / pyenv-virtualenv)
+set -euo pipefail
+
+VERSION="1.0.0"
+BHUSHAN_HOME="${BHUSHAN_HOME:-$HOME/.bhushan}"
+ENVS="$BHUSHAN_HOME/envs"
+mkdir -p "$ENVS"
+
+if [ -t 1 ]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'; else G=; R=; Y=; B=; N=; fi
+die()  { echo "${R}error:${N} $*" >&2; exit 1; }
+ok()   { echo "${G}✓${N} $*"; }
+info() { echo "${Y}→${N} $*"; }
+
+valid_name() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid env name '${1:-}' (use letters, digits, . _ -)"; }
+env_dir()    { echo "$ENVS/$1"; }
+env_exists() { [ -x "$ENVS/$1/bin/python" ]; }
+
+list_pythons() {
+  { command -v python3 >/dev/null && echo "python3"; compgen -c python3. ; } 2>/dev/null \
+    | grep -E '^python3(\.[0-9]+)?$' | sort -uV | while read -r p; do
+      v=$("$p" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null) || continue
+      printf "  %-12s %s  (%s)\n" "$p" "$v" "$(command -v "$p")"
+    done
+}
+
+find_python() {
+  local v="${1:-}"
+  if [ -z "$v" ]; then command -v python3 || die "python3 not found"; return; fi
+  command -v "python$v" || die "python$v not found. Run 'bhushan pythons' to see available versions."
+}
+
+active_name() {
+  [ -n "${VIRTUAL_ENV:-}" ] && [ "$(dirname "$VIRTUAL_ENV")" = "$ENVS" ] && basename "$VIRTUAL_ENV" || true
+}
+
+# resolve target env: -n NAME option, else active env
+target_env() {
+  local n="${1:-}"
+  [ -n "$n" ] || n="$(active_name)"
+  [ -n "$n" ] || die "no env active. Use 'bhushan activate NAME' or pass -n NAME"
+  env_exists "$n" || die "env '$n' does not exist"
+  echo "$n"
+}
+
+cmd_create() {
+  local name="" py="" req=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--python) py="${2:-}"; shift 2 ;;
+      -r|--requirements) req="${2:-}"; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  valid_name "$name"
+  env_exists "$name" && die "env '$name' already exists"
+  local pybin; pybin="$(find_python "$py")"
+  info "creating '$name' with $("$pybin" --version 2>&1)"
+  "$pybin" -m venv --prompt "$name" "$(env_dir "$name")" \
+    || die "venv failed. On Ubuntu run: sudo apt install python3-venv (or python${py:-3}-venv)"
+  "$(env_dir "$name")/bin/python" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
+  if [ -n "$req" ]; then
+    [ -f "$req" ] || die "requirements file '$req' not found"
+    info "installing packages from $req"
+    "$(env_dir "$name")/bin/pip" install -r "$req"
+  fi
+  ok "env '$name' created. Activate with: ${B}bhushan activate $name${N}"
+}
+
+cmd_list() {
+  local act; act="$(active_name)"
+  echo "${B}bhushan environments${N}  ($ENVS)"
+  local found=0
+  for d in "$ENVS"/*/; do
+    [ -x "$d/bin/python" ] || continue
+    found=1
+    local n; n="$(basename "$d")"
+    local v; v="$("$d/bin/python" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null || echo "?")"
+    if [ "$n" = "$act" ]; then printf "  ${G}* %-20s${N} python %s\n" "$n" "$v"
+    else printf "    %-20s python %s\n" "$n" "$v"; fi
+  done
+  [ $found = 1 ] || echo "  (none yet — try: bhushan create myenv)"
+}
+
+cmd_remove() {
+  local name="${1:-}"; valid_name "$name"
+  env_exists "$name" || die "env '$name' does not exist"
+  [ "$name" = "$(active_name)" ] && die "deactivate '$name' first"
+  rm -rf "$(env_dir "$name")"
+  ok "env '$name' removed"
+}
+
+cmd_pip() { # install / uninstall / packages
+  local action="$1"; shift
+  local name=""
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--name) name="${2:-}"; shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  name="$(target_env "$name")"
+  local pip="$(env_dir "$name")/bin/pip"
+  case "$action" in
+    install)   [ ${#args[@]} -gt 0 ] || die "usage: bhushan install PACKAGE..."; "$pip" install "${args[@]}" && ok "installed into '$name'" ;;
+    uninstall) [ ${#args[@]} -gt 0 ] || die "usage: bhushan uninstall PACKAGE..."; "$pip" uninstall -y "${args[@]}" && ok "removed from '$name'" ;;
+    packages)  echo "${B}packages in '$name'${N}"; "$pip" list ;;
+  esac
+}
+
+cmd_export() {
+  local name; name="$(target_env "${1:-}")"
+  "$(env_dir "$name")/bin/pip" freeze
+}
+
+cmd_clone() {
+  local src="${1:-}" dst="${2:-}"
+  valid_name "$src"; valid_name "$dst"
+  env_exists "$src" || die "env '$src' does not exist"
+  env_exists "$dst" && die "env '$dst' already exists"
+  local tmp; tmp="$(mktemp)"
+  "$(env_dir "$src")/bin/pip" freeze > "$tmp"
+  local pyv; pyv="$("$(env_dir "$src")/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+  cmd_create "$dst" --python "$pyv" --requirements "$tmp"
+  rm -f "$tmp"
+}
+
+cmd_run() {
+  local name="${1:-}"; shift || true
+  valid_name "$name"; env_exists "$name" || die "env '$name' does not exist"
+  [ $# -gt 0 ] || die "usage: bhushan run NAME COMMAND..."
+  VIRTUAL_ENV="$(env_dir "$name")" PATH="$(env_dir "$name")/bin:$PATH" exec "$@"
+}
+
+cmd_init() {
+  cat <<'EOF'
+bhushan() {
+  case "${1:-}" in
+    activate)
+      local _d; _d="$(command bhushan __path "${2:-}")" || return 1
+      if [ -n "${VIRTUAL_ENV:-}" ] && type deactivate >/dev/null 2>&1; then deactivate; fi
+      . "$_d/bin/activate" ;;
+    deactivate)
+      if [ -n "${VIRTUAL_ENV:-}" ] && type deactivate >/dev/null 2>&1; then deactivate
+      else echo "no bhushan env is active" >&2; return 1; fi ;;
+    *) command bhushan "$@" ;;
+  esac
+}
+EOF
+}
+
+cmd_help() {
+  cat <<EOF
+${B}bhushan${N} $VERSION — simple Python environment manager
+
+${B}Environments${N}
+  bhushan create NAME [-p 3.12] [-r requirements.txt]   create an env
+  bhushan activate NAME                                 activate an env
+  bhushan deactivate                                    deactivate current env
+  bhushan list                                          list envs (* = active)
+  bhushan remove NAME                                   delete an env
+  bhushan clone SRC DST                                 copy an env
+  bhushan run NAME COMMAND...                           run a command inside an env
+
+${B}Packages${N} (active env, or -n NAME)
+  bhushan install PKG...        pip install
+  bhushan uninstall PKG...      pip uninstall
+  bhushan packages              list installed packages
+  bhushan export [NAME]         print requirements (pip freeze)
+
+${B}Other${N}
+  bhushan pythons               list Python versions on this system
+  bhushan version               show version
+EOF
+}
+
+case "${1:-help}" in
+  create)    shift; cmd_create "$@" ;;
+  list|envs|ls) cmd_list ;;
+  remove|rm|delete) shift; cmd_remove "$@" ;;
+  clone)     shift; cmd_clone "$@" ;;
+  run)       shift; cmd_run "$@" ;;
+  install)   shift; cmd_pip install "$@" ;;
+  uninstall) shift; cmd_pip uninstall "$@" ;;
+  packages|pkgs) shift; cmd_pip packages "$@" ;;
+  export|freeze) shift; cmd_export "$@" ;;
+  pythons)   echo "${B}available Python versions${N}"; list_pythons ;;
+  init)      cmd_init ;;
+  __path)    shift; valid_name "${1:-}"; env_exists "$1" || die "env '$1' does not exist (see: bhushan list)"; env_dir "$1" ;;
+  activate|deactivate)
+    die "shell integration not loaded. Run: ${B}source ~/.bashrc${N}  (or: eval \"\$(bhushan init)\")" ;;
+  version|--version|-v) echo "bhushan $VERSION" ;;
+  help|--help|-h) cmd_help ;;
+  *) die "unknown command '$1'. Run: bhushan help" ;;
+esac
